@@ -1,0 +1,6 @@
+name: UltraRequest
+version: 1.0.0
+namespace: Amirxd\UltraRequest
+antigen: Amirxd\UltraRequest
+author: Amirxd
+api: 5.0.0
