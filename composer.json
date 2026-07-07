@@ -1,0 +1,21 @@
+{
+    "name": "amirxd/ultra-request",
+    "description": "A powerful, fluent HTTP client Virion for PocketMine-MP 5",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1",
+        "ext-curl": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Amirxd\\UltraRequest\\": "src/Amirxd/UltraRequest"
+        }
+    },
+    "extra": {
+        "virion": {
+            "spec": "3.0",
+            "name": "UltraRequest"
+        }
+    }
+}
