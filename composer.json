@@ -1,21 +1,27 @@
 {
-    "name": "amirxd/pmmp-ultra-request",
-    "description": "A powerful, fluent HTTP client Virion for PocketMine-MP 5",
-    "type": "library",
-    "license": "MIT",
-    "require": {
-        "php": ">=8.1",
-        "ext-curl": "*"
-    },
-    "autoload": {
-        "psr-4": {
-            "Amirxd\\UltraRequest\\": "src/Amirxd/UltraRequest"
-        }
-    },
-    "extra": {
-        "virion": {
-            "spec": "3.0",
-            "name": "UltraRequest"
-        }
+  "name": "amirxd/pmmp-ultra-request",
+  "description": "A powerful, fluent HTTP client Virion for PocketMine-MP 5",
+  "type": "library",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "amirxdcy4455",
+      "email": "amirxd4488@gmail.com"
     }
+  ],
+  "require": {
+    "php": ">=8.0",
+    "pocketmine/pocketmine-mp": "^5.0.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "Amirxd\\UltraRequest\\": "src/Amirxd/UltraRequest"
+    }
+  },
+  "extra": {
+    "virion": {
+      "spec": "3.0",
+      "namespace-root": "Amirxd\\UltraRequest"
+    }
+  }
 }
