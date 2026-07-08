@@ -1,5 +1,5 @@
 {
-    "name": "amirxd/ultra-request",
+    "name": "amirxd/pmmp-ultra-request",
     "description": "A powerful, fluent HTTP client Virion for PocketMine-MP 5",
     "type": "library",
     "license": "MIT",
