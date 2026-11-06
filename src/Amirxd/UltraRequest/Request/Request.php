@@ -3,18 +3,33 @@
 namespace Amirxd\UltraRequest\Request;
 
 class Request implements RequestInterface {
-    public string $method = 'GET';
-    public string $url;
-    public array $headers = [];
-    public mixed $body = null;
-    public bool $followRedirects = true;
-    public ?int $maxRedirects = 10;
-    public array $queryParams = [];
-    public ?array $urlMethod = null;
+    private string $method = 'GET';
+    private string $url;
+    private array $headers = [];
+    private mixed $body = null;
+    private bool $followRedirects = true;
+    private ?int $maxRedirects = 10;
+    private array $queryParams = [];
+    private ?array $urlMethod = null;
 
     public function __construct(string $method, string $url) {
-        $this->method = strtoupper($method);
-        $this->url    = $url;
+        $method = strtoupper(trim($method));
+        $parts = parse_url($url);
+
+        if (!preg_match("@^[A-Z0-9!#$%&'*+.^_\`|~-]+$@", $method)) {
+            throw new \InvalidArgumentException("Invalid HTTP method: " . $method);
+        }
+
+        if ($url === '' || $parts === false || !isset($parts['scheme'], $parts['host'])) {
+            throw new \InvalidArgumentException("A valid absolute HTTP URL is required");
+        }
+
+        if (!in_array(strtolower($parts['scheme']), ['http', 'https'], true)) {
+            throw new \InvalidArgumentException("Only HTTP and HTTPS URLs are supported");
+        }
+
+        $this->method = $method;
+        $this->url = $url;
     }
 
     public static function get(string $url): self    { return new self('GET',    $url); }
@@ -25,8 +40,17 @@ class Request implements RequestInterface {
     public static function head(string $url): self   { return new self('HEAD',   $url); }
 
     public function withHeader(string $name, string $value): self {
+        if (!preg_match("@^[!#$%&'*+.^_\`|~0-9A-Za-z-]+$@", $name)) {
+            throw new \InvalidArgumentException("Invalid HTTP header name: " . $name);
+        }
+
+        if (strpbrk($value, "\r\n") !== false) {
+            throw new \InvalidArgumentException("HTTP header values cannot contain line breaks");
+        }
+
         $clone = clone $this;
         $clone->headers[$name] = $value;
+
         return $clone;
     }
 
@@ -43,9 +67,12 @@ class Request implements RequestInterface {
     }
 
     public function withJson(array $data): self {
+        $json = json_encode($data, JSON_THROW_ON_ERROR);
+
         $clone = clone $this;
         $clone->headers['Content-Type'] = 'application/json';
-        $clone->body = json_encode($data);
+        $clone->body = $json;
+
         return $clone;
     }
 
@@ -62,8 +89,13 @@ class Request implements RequestInterface {
     }
 
     public function withMaxRedirects(int $max): self {
+        if ($max < 0) {
+            throw new \InvalidArgumentException("Maximum redirects cannot be negative");
+        }
+
         $clone = clone $this;
         $clone->maxRedirects = $max;
+
         return $clone;
     }
 
@@ -78,32 +110,35 @@ class Request implements RequestInterface {
     public function getUrl(): string {
         $allParams = $this->queryParams;
         $urlMethod = $this->getUrlMethod();
+
         if ($urlMethod !== null && isset($urlMethod['name'], $urlMethod['value'])) {
             $allParams[$urlMethod['name']] = $urlMethod['value'];
         }
-        if (empty($allParams)) return $this->url;
 
-        $parsed   = parse_url($this->url);
-        $fragment = isset($parsed['fragment']) ? '#' . $parsed['fragment'] : '';
-        $existing = [];
-        if (isset($parsed['query'])) parse_str($parsed['query'], $existing);
-
-        $merged   = array_merge($existing, $allParams);
-        $newQuery = http_build_query($merged);
-        $scheme   = $parsed['scheme'] ?? '';
-        $host     = $parsed['host']   ?? '';
-        $port     = isset($parsed['port']) ? ':' . $parsed['port'] : '';
-        $path     = $parsed['path']   ?? '';
-
-        if (!empty($host)) {
-            $base = (!empty($scheme) ? $scheme . '://' : '') . $host . $port . $path;
-            return $base . '?' . $newQuery . $fragment;
+        if ($allParams === []) {
+            return $this->url;
         }
 
-        $separator   = strpos($this->url, '?') === false ? '?' : '&';
-        $queryPart   = $newQuery !== '' ? $separator . $newQuery : '';
-        $urlNoFrag   = preg_replace('/#.*$/', '', $this->url);
-        return $urlNoFrag . $queryPart . $fragment;
+        $url = $this->url;
+        $fragment = '';
+        $fragmentPosition = strpos($url, '#');
+
+        if ($fragmentPosition !== false) {
+            $fragment = substr($url, $fragmentPosition);
+            $url = substr($url, 0, $fragmentPosition);
+        }
+
+        $existingParams = [];
+        $queryPosition = strpos($url, '?');
+
+        if ($queryPosition !== false) {
+            parse_str(substr($url, $queryPosition + 1), $existingParams);
+            $url = substr($url, 0, $queryPosition);
+        }
+
+        $query = http_build_query(array_merge($existingParams, $allParams));
+
+        return $url . ($query !== '' ? '?' . $query : '') . $fragment;
     }
 
     public function getHeaders(): array        { return $this->headers; }

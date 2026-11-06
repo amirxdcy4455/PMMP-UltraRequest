@@ -46,8 +46,8 @@
 - **Authentication** — Basic, Bearer Token, and API Key (header or query)
 - **Cookie management** — in-memory or file-persisted CookieJar with domain/path matching
 - **Proxy support** — HTTP, HTTPS, SOCKS4, SOCKS5 with optional authentication
-- **File downloading** — resumable downloads with progress callbacks and retry logic
-- **Redirect handling** — manual redirect control with RFC 7231 compliance (301/302/303 → GET)
+- **File downloading** — streamed-to-disk downloads with validated resume support, progress callbacks and retry logic
+- **Redirect handling** — bounded manual redirects, loop detection, relative URL resolution and cross-origin credential isolation
 - **SSL control** — enable or disable SSL verification per client
 - **Custom cURL options** — full escape hatch to any cURL option
 - **Thread-safe async** — closures stored via `storeLocal`/`fetchLocal`, never serialized
@@ -123,7 +123,7 @@ public function onEnable(): void {
 }
 ```
 
-> **Note:** Calling `register()` more than once is safe — subsequent calls are silently ignored.
+> **Note:** Multiple plugins can register safely. Call `RequestHandler::unregister($this)` from `onDisable()` to release the registration.
 
 You can check registration status anywhere:
 
@@ -446,7 +446,8 @@ $client->download($downloader);
 ```php
 $downloader = (new Downloader($url, $savePath))
     ->withResume();
-// Sends Range: bytes=<existing_size>- and appends to the file
+// Sends Range: bytes=<existing_size>- and appends only to a matching 206 response.
+// If the server ignores Range and responds with 200, the partial file is replaced.
 ```
 
 ### Progress Callback
@@ -497,7 +498,7 @@ $downloader = (new Downloader($url, $savePath))
 
 ## ⚙️ Client Configuration
 
-All `with*` methods on `Client` return a **new immutable clone**.
+All `with*` methods on `Client` and `Request` return a **new immutable clone**. Request state is private and must be changed through its fluent methods.
 
 ```php
 $client = (new Client())
@@ -658,9 +659,10 @@ UltraRequest/
 
 | Method | Description |
 |--------|-------------|
-| `register(PluginBase $plugin): void` | Register your plugin (call once in `onEnable`) |
-| `isRegistered(): bool` | Check if a plugin has been registered |
-| `getRegistrant(): ?PluginBase` | Get the registered plugin instance |
+| `register(PluginBase $plugin): void` | Register an enabled plugin as an AsyncPool provider |
+| `unregister(PluginBase $plugin): void` | Remove a plugin registration (call in `onDisable`) |
+| `isRegistered(): bool` | Check whether an enabled plugin is registered |
+| `getRegistrant(): ?PluginBase` | Get the first enabled registered plugin |
 
 ---
 

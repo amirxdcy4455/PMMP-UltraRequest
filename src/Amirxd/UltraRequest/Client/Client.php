@@ -23,9 +23,6 @@ class Client {
     private ?AuthManager $auth = null;
     private array $curlOptions = [];
 
-    private int $redirectCount = 0;
-    private array $redirectHistory = [];
-
     public function __construct() {
         if (!extension_loaded('curl')) {
             throw new \RuntimeException('cURL extension is required for Amirxd\UltraRequest');
@@ -76,112 +73,596 @@ class Client {
         $clone = clone $this; $clone->curlOptions[$option] = $value; return $clone;
     }
 
+    /**
+     * Downloads a file directly to disk. The response body is streamed by cURL,
+     * so large files are never accumulated in memory.
+     */
     public function download(Downloader $downloader): bool {
         if (!$downloader->shouldDownload()) {
             throw new \RuntimeException("File already exists: " . $downloader->getSavePath());
         }
 
         $maxRetries = $downloader->getMaxRetries();
-        $attempt    = 0;
-        $ch         = null;
+        $attempt = 0;
 
         do {
             try {
                 $request = $downloader->getRequest();
-                $ch      = curl_init();
-                if ($ch === false) throw new \RuntimeException("Failed to initialize cURL");
+                $includeAuth = true;
+                $redirectCount = 0;
+                $visited = [];
+                $currentUrl = $this->buildRequestUrl($request, $includeAuth);
 
-                $options = $this->buildBaseOptions($request->getUrl(), $request);
-                $options = $this->addHeaders($options, $request);
-                $options = $this->addCookies($options, $request);
-                $options = $this->addProxy($options);
-                $options = $this->addCustomCurlOptions($options);
+                while (true) {
+                    if (isset($visited[$currentUrl])) {
+                        throw new \RuntimeException("Redirect loop detected while downloading: " . $currentUrl);
+                    }
 
-                $options[CURLOPT_RETURNTRANSFER] = true;
-                $options[CURLOPT_HEADER]         = true;
+                    $visited[$currentUrl] = true;
+                    $result = $this->executeDownloadRequest(
+                        $currentUrl,
+                        $request,
+                        $downloader,
+                        $includeAuth
+                    );
 
-                if ($downloader->canResume()) {
-                    $options[CURLOPT_RESUME_FROM] = $downloader->getExistingSize();
+                    if (!$result['success']) {
+                        $message = $result['writeError'] ?? $result['error'];
+                        throw new \RuntimeException(
+                            "Download request failed (" . $result['errno'] . "): " . $message
+                        );
+                    }
+
+                    // Keep cookies returned by intermediate redirect responses as well.
+                    if ($this->cookieJar !== null && $result['rawHeaders'] !== '') {
+                        $this->saveCookiesFromResponse($result['rawHeaders'], $currentUrl);
+                    }
+
+                    $statusCode = $result['status'];
+                    $location = $result['headers']['location'] ?? null;
+
+                    if ($this->isRedirectStatus($statusCode) && $location !== null && $location !== '') {
+                        $maxRedirects = $request->getMaxRedirects() ?? 10;
+
+                        if ($redirectCount >= $maxRedirects) {
+                            throw new \RuntimeException("Maximum redirects ($maxRedirects) exceeded");
+                        }
+
+                        $targetUrl = $this->resolveRelativeUrl($currentUrl, $location);
+                        $sameOrigin = $this->isSameOrigin($currentUrl, $targetUrl);
+
+                        // Credentials are deliberately not restored after leaving the original origin.
+                        $includeAuth = $includeAuth && $sameOrigin;
+                        $request = $this->buildRedirectRequest($request, $targetUrl, $statusCode, $sameOrigin);
+                        $currentUrl = $this->buildRequestUrl($request, $includeAuth);
+                        $redirectCount++;
+                        continue;
+                    }
+
+                    if ($statusCode < 200 || $statusCode >= 300) {
+                        throw new \RuntimeException("Server returned HTTP status " . $statusCode);
+                    }
+
+                    if ($result['writeError'] !== null) {
+                        throw new \RuntimeException($result['writeError']);
+                    }
+
+                    return true;
                 }
-
-                $options[CURLOPT_NOPROGRESS]      = false;
-                $options[CURLOPT_PROGRESSFUNCTION] = function($resource, $downloadSize, $downloaded, $uploadSize, $uploaded) use ($downloader) {
-                    $downloader->callProgress($downloaded, $downloadSize);
-                };
-
-                $this->applyCurlOptions($ch, $options);
-
-                $response = curl_exec($ch);
-                $error    = curl_error($ch);
-                $errno    = curl_errno($ch);
-                $info     = curl_getinfo($ch);
-
-                if ($response === false) throw new \Exception("cURL Error ($errno): $error");
-
-                $httpResponse = $this->parseResponse($response, $info, $request);
-                if ($downloader->save($httpResponse)) return true;
-                throw new \Exception("Failed to save file");
-
-            } catch (\Exception $e) {
+            } catch (\Throwable $e) {
                 $attempt++;
-                if ($ch !== null && is_resource($ch)) { curl_close($ch); $ch = null; }
-                if ($maxRetries !== null && $attempt >= $maxRetries) {
-                    throw new \Exception("Download failed after $maxRetries attempts: " . $e->getMessage());
-                }
-                if ($maxRetries !== null) sleep($downloader->getRetryDelay());
-            }
-        } while ($maxRetries !== null && $attempt < $maxRetries);
 
-        return false;
+                if ($maxRetries === null || $attempt >= $maxRetries) {
+                    throw new \RuntimeException(
+                        "Download failed after $attempt attempt(s): " . $e->getMessage(),
+                        0,
+                        $e
+                    );
+                }
+
+                if ($downloader->getRetryDelay() > 0) {
+                    sleep($downloader->getRetryDelay());
+                }
+            }
+        } while (true);
     }
 
-    public function send(RequestInterface $request): HttpResponse {
+    /**
+     * Performs one streamed download request. Redirects are handled by download()
+     * so that credentials and resume state can be checked before following them.
+     */
+    private function executeDownloadRequest(
+        string $url,
+        RequestInterface $request,
+        Downloader $downloader,
+        bool $includeAuth
+    ): array {
         $ch = curl_init();
-        if ($ch === false) throw new \RuntimeException("Failed to initialize cURL");
 
-        $this->redirectCount   = 0;
-        $this->redirectHistory = [];
+        if ($ch === false) {
+            throw new \RuntimeException("Failed to initialize cURL");
+        }
 
-        $options = $this->buildBaseOptions($request->getUrl(), $request);
-        $options = $this->addHeaders($options, $request);
-        $options = $this->addCookies($options, $request);
-        $options = $this->addProxy($options);
-        $options = $this->addCustomCurlOptions($options);
+        $fileHandle = null;
+        $statusCode = 0;
+        $headers = [];
+        $rawHeaders = '';
+        $writeError = null;
+        $initialSize = $downloader->canResume() ? $downloader->getExistingSize() : 0;
 
-        $followRedirects = $request->followsRedirects();
-        if ($followRedirects) $options[CURLOPT_FOLLOWLOCATION] = false;
-        $options[CURLOPT_UNRESTRICTED_AUTH] = $followRedirects;
+        try {
+            $options = $this->buildBaseOptions($url, $request);
+            $options = $this->addHeaders($options, $request, $includeAuth);
+            $options = $this->addCookies($options, $request);
+            $options = $this->addProxy($options);
+            $options = $this->addCustomCurlOptions($options);
 
-        $this->applyCurlOptions($ch, $options);
+            if (!$includeAuth) {
+                unset(
+                    $options[CURLOPT_USERPWD],
+                    $options[CURLOPT_USERNAME],
+                    $options[CURLOPT_PASSWORD]
+                );
+            }
 
-        $response = curl_exec($ch);
-        $error    = curl_error($ch);
-        $errno    = curl_errno($ch);
-        $info     = curl_getinfo($ch);
+            // Override transfer options after custom options to guarantee streaming.
+            $options[CURLOPT_URL] = $url;
+            $options[CURLOPT_RETURNTRANSFER] = false;
+            $options[CURLOPT_HEADER] = false;
+            $options[CURLOPT_FOLLOWLOCATION] = false;
+            $options[CURLOPT_UNRESTRICTED_AUTH] = false;
+            $options[CURLOPT_BUFFERSIZE] = max(1024, min(10 * 1024 * 1024, $downloader->getChunkSize()));
 
-        if ($response === false) {
+            $options[CURLOPT_HEADERFUNCTION] = function ($handle, string $line) use (
+                &$statusCode,
+                &$headers,
+                &$rawHeaders,
+                &$fileHandle,
+                &$writeError,
+                &$initialSize,
+                $downloader
+            ): int {
+                $rawHeaders .= $line;
+                $trimmed = trim($line);
+
+                if (preg_match('/^HTTP\/\S+\s+(\d{3})/i', $trimmed, $matches)) {
+                    $statusCode = (int) $matches[1];
+                    $headers = [];
+                    return strlen($line);
+                }
+
+                if ($trimmed === '') {
+                    $mode = null;
+
+                    if ($statusCode === 200) {
+                        // A server may ignore Range and return the complete file.
+                        // In that case the old partial file must be truncated.
+                        $initialSize = 0;
+                        $mode = 'wb';
+                    } elseif ($statusCode === 206) {
+                        $contentRange = $headers['content-range'] ?? '';
+
+                        if (
+                            !preg_match('/^bytes\s+(\d+)-(\d+)\/(?:\d+|\*)$/i', $contentRange, $range)
+                            || (int) $range[1] !== $initialSize
+                        ) {
+                            $writeError = "Invalid Content-Range header for resumed download";
+                            return strlen($line);
+                        }
+
+                        $mode = $initialSize > 0 ? 'ab' : 'wb';
+                    }
+
+                    if ($mode !== null) {
+                        $directory = dirname($downloader->getSavePath());
+
+                        if (!is_dir($directory) && !mkdir($directory, 0777, true) && !is_dir($directory)) {
+                            $writeError = "Unable to create download directory: " . $directory;
+                            return strlen($line);
+                        }
+
+                        $fileHandle = fopen($downloader->getSavePath(), $mode);
+
+                        if ($fileHandle === false) {
+                            $fileHandle = null;
+                            $writeError = "Unable to open download target: " . $downloader->getSavePath();
+                        }
+                    }
+
+                    return strlen($line);
+                }
+
+                $separator = strpos($trimmed, ':');
+                if ($separator !== false) {
+                    $name = strtolower(trim(substr($trimmed, 0, $separator)));
+                    $value = trim(substr($trimmed, $separator + 1));
+                    $headers[$name] = $value;
+                }
+
+                return strlen($line);
+            };
+
+            $options[CURLOPT_WRITEFUNCTION] = function ($handle, string $data) use (
+                &$fileHandle,
+                &$statusCode,
+                &$writeError
+            ): int {
+                $length = strlen($data);
+
+                // Ignore redirect and error response bodies; they are not file data.
+                if ($statusCode < 200 || $statusCode >= 300) {
+                    return $length;
+                }
+
+                if ($writeError !== null || !is_resource($fileHandle)) {
+                    return 0;
+                }
+
+                $written = 0;
+                while ($written < $length) {
+                    $result = fwrite($fileHandle, substr($data, $written));
+
+                    if ($result === false || $result === 0) {
+                        $writeError = "Unable to write downloaded data to disk";
+                        return 0;
+                    }
+
+                    $written += $result;
+                }
+
+                return $length;
+            };
+
+            $options[CURLOPT_NOPROGRESS] = false;
+            $options[CURLOPT_PROGRESSFUNCTION] = function (
+                $resource,
+                $downloadSize,
+                $downloaded,
+                $uploadSize,
+                $uploaded
+            ) use ($downloader, &$initialSize): int {
+                $total = $downloadSize > 0 ? $downloadSize + $initialSize : 0;
+                $downloader->callProgress($downloaded + $initialSize, $total);
+                return 0;
+            };
+
+            $this->applyCurlOptions($ch, $options);
+
+            $success = curl_exec($ch);
+            $error = curl_error($ch);
+            $errno = curl_errno($ch);
+            $info = curl_getinfo($ch);
+
+            if (is_resource($fileHandle)) {
+                fclose($fileHandle);
+                $fileHandle = null;
+            }
+
+            if ($this->cookieJar !== null && $rawHeaders !== '') {
+                $this->saveCookiesFromResponse($rawHeaders, $url);
+            }
+
+            return [
+                'success' => $success !== false,
+                'status' => (int) ($info['http_code'] ?? $statusCode),
+                'headers' => $headers,
+                'rawHeaders' => $rawHeaders,
+                'error' => $error,
+                'errno' => $errno,
+                'writeError' => $writeError,
+                'info' => $info
+            ];
+        } finally {
+            if (is_resource($fileHandle)) {
+                fclose($fileHandle);
+            }
+
             curl_close($ch);
-            throw new \Exception("cURL Error ($errno): $error");
+        }
+    }
+
+    /**
+     * Starts a request and follows redirects manually. The redirect context is local
+     * to this call, so concurrent requests using the same Client cannot reset it.
+     */
+    public function send(RequestInterface $request): HttpResponse {
+        return $this->sendWithRedirects($request, 0, [], true);
+    }
+
+    private function sendWithRedirects(
+        RequestInterface $request,
+        int $redirectCount,
+        array $visited,
+        bool $includeAuth
+    ): HttpResponse {
+        $url = $this->buildRequestUrl($request, $includeAuth);
+
+        if (isset($visited[$url])) {
+            throw new \RuntimeException("Redirect loop detected: " . $url);
         }
 
-        $httpResponse = $this->parseResponse($response, $info, $request);
+        $visited[$url] = true;
+        $ch = curl_init();
 
-        if ($followRedirects && $this->shouldRedirect($httpResponse)) {
-            $maxRedirects = $request->getMaxRedirects() ?? 10;
-            if ($this->redirectCount >= $maxRedirects) {
-                curl_close($ch);
-                throw new \Exception("Maximum redirects ($maxRedirects) exceeded");
-            }
-            $location = $httpResponse->getHeader('Location');
-            if ($location) {
-                $newRequest = $this->buildRedirectRequest($request, $location, $httpResponse);
-                curl_close($ch);
-                return $this->send($newRequest);
-            }
+        if ($ch === false) {
+            throw new \RuntimeException("Failed to initialize cURL");
         }
 
-        curl_close($ch);
-        return $httpResponse;
+        try {
+            $options = $this->buildBaseOptions($url, $request);
+            $options = $this->addHeaders($options, $request, $includeAuth);
+            $options = $this->addCookies($options, $request);
+            $options = $this->addProxy($options);
+            $options = $this->addCustomCurlOptions($options);
+
+            // Redirects are followed manually to prevent cross-origin credential leaks.
+            $options[CURLOPT_URL] = $url;
+            $options[CURLOPT_FOLLOWLOCATION] = false;
+            $options[CURLOPT_UNRESTRICTED_AUTH] = false;
+
+            if (!$includeAuth) {
+                unset(
+                    $options[CURLOPT_USERPWD],
+                    $options[CURLOPT_USERNAME],
+                    $options[CURLOPT_PASSWORD]
+                );
+            }
+
+            $this->applyCurlOptions($ch, $options);
+
+            $response = curl_exec($ch);
+            $error = curl_error($ch);
+            $errno = curl_errno($ch);
+            $info = curl_getinfo($ch);
+
+            if ($response === false) {
+                throw new \RuntimeException("cURL Error ($errno): $error");
+            }
+
+            $httpResponse = $this->parseResponse($response, $info, $request, $url);
+
+            if ($request->followsRedirects() && $this->shouldRedirect($httpResponse)) {
+                $location = $httpResponse->getHeader('Location');
+
+                if ($location !== null && $location !== '') {
+                    $maxRedirects = $request->getMaxRedirects() ?? 10;
+
+                    if ($redirectCount >= $maxRedirects) {
+                        throw new \RuntimeException("Maximum redirects ($maxRedirects) exceeded");
+                    }
+
+                    $targetUrl = $this->resolveRelativeUrl($url, $location);
+                    $sameOrigin = $this->isSameOrigin($url, $targetUrl);
+
+                    // Once a request leaves its original origin, never re-attach its credentials.
+                    $nextIncludeAuth = $includeAuth && $sameOrigin;
+                    $nextRequest = $this->buildRedirectRequest(
+                        $request,
+                        $targetUrl,
+                        $httpResponse->getStatusCode(),
+                        $sameOrigin
+                    );
+
+                    return $this->sendWithRedirects(
+                        $nextRequest,
+                        $redirectCount + 1,
+                        $visited,
+                        $nextIncludeAuth
+                    );
+                }
+            }
+
+            return $httpResponse;
+        } finally {
+            curl_close($ch);
+        }
+    }
+
+    private function shouldRedirect(HttpResponse $response): bool {
+        return $this->isRedirectStatus($response->getStatusCode());
+    }
+
+    private function isRedirectStatus(int $statusCode): bool {
+        return in_array($statusCode, [301, 302, 303, 307, 308], true);
+    }
+
+    /**
+     * Builds a safe follow-up request. Authorization and cookie headers are removed
+     * whenever a redirect changes origin.
+     */
+    private function buildRedirectRequest(
+        RequestInterface $originalRequest,
+        string $targetUrl,
+        int $statusCode,
+        bool $sameOrigin
+    ): RequestInterface {
+        $method = $originalRequest->getMethod();
+        $body = $originalRequest->getBody();
+
+        if (($statusCode === 303 && $method !== 'HEAD') || (in_array($statusCode, [301, 302], true) && $method === 'POST')) {
+            $method = 'GET';
+            $body = null;
+        }
+
+        $request = new Request($method, $targetUrl);
+
+        foreach ($originalRequest->getHeaders() as $name => $value) {
+            $normalizedName = strtolower($name);
+
+            if (in_array($normalizedName, ['content-length', 'host'], true)) {
+                continue;
+            }
+
+            if ($body === null && in_array($normalizedName, ['content-type', 'transfer-encoding'], true)) {
+                continue;
+            }
+
+            if (!$sameOrigin && $this->isSensitiveHeader($normalizedName)) {
+                continue;
+            }
+
+            $request = $request->withHeader($name, $value);
+        }
+
+        if ($body !== null) {
+            $request = $request->withBody($body);
+        }
+
+        $request = $request->withMaxRedirects($originalRequest->getMaxRedirects() ?? 10);
+
+        if (!$originalRequest->followsRedirects()) {
+            $request = $request->withoutRedirects();
+        }
+
+        return $request;
+    }
+
+    private function isSensitiveHeader(string $name): bool {
+        return in_array(
+            strtolower($name),
+            ['authorization', 'proxy-authorization', 'cookie', 'cookie2'],
+            true
+        );
+    }
+
+    /**
+     * Resolves absolute, protocol-relative, root-relative, path-relative,
+     * query-only and fragment-only redirect locations.
+     */
+    private function resolveRelativeUrl(string $baseUrl, string $relativeUrl): string {
+        if (parse_url($relativeUrl, PHP_URL_SCHEME) !== null) {
+            return $relativeUrl;
+        }
+
+        $base = parse_url($baseUrl);
+
+        if ($base === false || !isset($base['scheme'], $base['host'])) {
+            throw new \InvalidArgumentException("Invalid base URL: " . $baseUrl);
+        }
+
+        $scheme = $base['scheme'];
+        $authority = $base['host'];
+
+        if (isset($base['port'])) {
+            $authority .= ':' . $base['port'];
+        }
+
+        if (str_starts_with($relativeUrl, '//')) {
+            return $scheme . ':' . $relativeUrl;
+        }
+
+        $relative = parse_url($relativeUrl);
+        if ($relative === false) {
+            throw new \InvalidArgumentException("Invalid redirect URL: " . $relativeUrl);
+        }
+
+        $basePath = $base['path'] ?? '/';
+        $relativePath = $relative['path'] ?? '';
+
+        if ($relativePath === '') {
+            $path = $basePath;
+            $query = array_key_exists('query', $relative)
+                ? '?' . $relative['query']
+                : (isset($base['query']) ? '?' . $base['query'] : '');
+        } else {
+            if (str_starts_with($relativePath, '/')) {
+                $path = $relativePath;
+            } else {
+                $directory = substr($basePath, 0, strrpos($basePath, '/') + 1);
+                $path = $directory . $relativePath;
+            }
+
+            $path = $this->normalizeUrlPath($path);
+            $query = isset($relative['query']) ? '?' . $relative['query'] : '';
+        }
+
+        $fragment = isset($relative['fragment'])
+            ? '#' . $relative['fragment']
+            : '';
+
+        return $scheme . '://' . $authority . $path . $query . $fragment;
+    }
+
+    private function normalizeUrlPath(string $path): string {
+        $segments = [];
+
+        foreach (explode('/', $path) as $segment) {
+            if ($segment === '' || $segment === '.') {
+                continue;
+            }
+
+            if ($segment === '..') {
+                array_pop($segments);
+                continue;
+            }
+
+            $segments[] = $segment;
+        }
+
+        $normalized = '/' . implode('/', $segments);
+
+        if (str_ends_with($path, '/') && !str_ends_with($normalized, '/')) {
+            $normalized .= '/';
+        }
+
+        return $normalized;
+    }
+
+    private function isSameOrigin(string $firstUrl, string $secondUrl): bool {
+        $first = parse_url($firstUrl);
+        $second = parse_url($secondUrl);
+
+        if ($first === false || $second === false) {
+            return false;
+        }
+
+        $firstScheme = strtolower($first['scheme'] ?? '');
+        $secondScheme = strtolower($second['scheme'] ?? '');
+        $firstHost = strtolower($first['host'] ?? '');
+        $secondHost = strtolower($second['host'] ?? '');
+
+        $firstPort = $first['port'] ?? ($firstScheme === 'https' ? 443 : 80);
+        $secondPort = $second['port'] ?? ($secondScheme === 'https' ? 443 : 80);
+
+        return $firstScheme === $secondScheme
+            && $firstHost === $secondHost
+            && $firstPort === $secondPort;
+    }
+
+    /**
+     * Adds query-based authentication to the effective URL without dropping
+     * existing query parameters or fragments.
+     */
+    private function buildRequestUrl(RequestInterface $request, bool $includeAuth): string {
+        $url = $request->getUrl();
+        $queryParams = $includeAuth && $this->auth !== null
+            ? $this->auth->getQueryParams()
+            : [];
+
+        if ($queryParams === []) {
+            return $url;
+        }
+
+        $fragment = '';
+        $fragmentPosition = strpos($url, '#');
+
+        if ($fragmentPosition !== false) {
+            $fragment = substr($url, $fragmentPosition);
+            $url = substr($url, 0, $fragmentPosition);
+        }
+
+        $query = [];
+        $queryPosition = strpos($url, '?');
+
+        if ($queryPosition !== false) {
+            parse_str(substr($url, $queryPosition + 1), $query);
+            $url = substr($url, 0, $queryPosition);
+        }
+
+        $query = array_merge($query, $queryParams);
+        $encodedQuery = http_build_query($query);
+
+        return $url . ($encodedQuery !== '' ? '?' . $encodedQuery : '') . $fragment;
     }
 
     public function asyncSend(Request $request, ?Closure $onSuccess = null, ?Closure $onError = null): void {
@@ -279,12 +760,31 @@ class Client {
         return $options;
     }
 
-    private function addHeaders(array $options, RequestInterface $request): array {
+    private function addHeaders(array $options, RequestInterface $request, bool $includeAuth = true): array {
         $headers = [];
-        foreach ($this->defaultHeaders as $key => $value) $headers[] = $key . ': ' . $value;
-        if ($this->auth) foreach ($this->auth->getHeaders() as $key => $value) $headers[] = $key . ': ' . $value;
-        foreach ($request->getHeaders() as $key => $value) $headers[] = $key . ': ' . $value;
-        if (!empty($headers)) $options[CURLOPT_HTTPHEADER] = $headers;
+
+        foreach ($this->defaultHeaders as $key => $value) {
+            if ($includeAuth || !$this->isSensitiveHeader($key)) {
+                $headers[] = $key . ': ' . $value;
+            }
+        }
+
+        if ($includeAuth && $this->auth !== null) {
+            foreach ($this->auth->getHeaders() as $key => $value) {
+                $headers[] = $key . ': ' . $value;
+            }
+        }
+
+        foreach ($request->getHeaders() as $key => $value) {
+            if ($includeAuth || !$this->isSensitiveHeader($key)) {
+                $headers[] = $key . ': ' . $value;
+            }
+        }
+
+        if ($headers !== []) {
+            $options[CURLOPT_HTTPHEADER] = $headers;
+        }
+
         return $options;
     }
 
@@ -317,16 +817,21 @@ class Client {
         }
     }
 
-    private function parseResponse(string $response, array $info, RequestInterface $request): HttpResponse {
-        $headerSize = $info['header_size'];
+    private function parseResponse(
+        string $response,
+        array $info,
+        RequestInterface $request,
+        ?string $effectiveUrl = null
+    ): HttpResponse {
+        $headerSize = (int) ($info['header_size'] ?? 0);
         $rawHeaders = substr($response, 0, $headerSize);
-        $body       = substr($response, $headerSize);
+        $body = substr($response, $headerSize);
 
-        if ($this->cookieJar) {
-            $this->saveCookiesFromResponse($rawHeaders, $request->getUrl());
+        if ($this->cookieJar !== null) {
+            $this->saveCookiesFromResponse($rawHeaders, $effectiveUrl ?? $request->getUrl());
         }
 
-        return new HttpResponse($body, $rawHeaders, $info['http_code'], $info);
+        return new HttpResponse($body, $rawHeaders, (int) ($info['http_code'] ?? 0), $info);
     }
 
     private function saveCookiesFromResponse(string $rawHeaders, string $url): void {

@@ -4,23 +4,51 @@ declare(strict_types=1);
 
 namespace Amirxd\UltraRequest\Request;
 
-use pocketmine\plugin\Plugin;
 use pocketmine\plugin\PluginBase;
 
-class RequestHandler {
+final class RequestHandler {
 
-    private static ?PluginBase $plugin = null;
+    /** @var array<int, PluginBase> */
+    private static array $plugins = [];
+
+    /**
+     * Registers a plugin as an AsyncPool provider.
+     *
+     * Multiple plugins may register safely when they share this virion.
+     * Disabled plugin instances are ignored by getRegistrant().
+     */
+    public static function register(PluginBase $plugin): void {
+        if (!$plugin->isEnabled()) {
+            throw new \InvalidArgumentException("Only enabled plugins can be registered");
+        }
+
+        self::$plugins[spl_object_id($plugin)] = $plugin;
+    }
+
+    /**
+     * Removes a plugin registration. Call this from onDisable() when possible.
+     */
+    public static function unregister(PluginBase $plugin): void {
+        unset(self::$plugins[spl_object_id($plugin)]);
+    }
 
     public static function isRegistered(): bool {
-        return self::$plugin !== null;
+        return self::getRegistrant() !== null;
     }
 
-    public static function register(PluginBase $plugin): void {
-        if (self::isRegistered()) return;
-        self::$plugin = $plugin;
-    }
-
+    /**
+     * Returns the first active plugin that can provide an AsyncPool.
+     */
     public static function getRegistrant(): ?PluginBase {
-        return self::$plugin;
+        foreach (self::$plugins as $id => $plugin) {
+            if (!$plugin->isEnabled()) {
+                unset(self::$plugins[$id]);
+                continue;
+            }
+
+            return $plugin;
+        }
+
+        return null;
     }
 }
