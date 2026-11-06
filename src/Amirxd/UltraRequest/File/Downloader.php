@@ -51,12 +51,15 @@ class Downloader {
     }
 
     public function withProgress(callable $callback): self {
-        $clone = clone $this; $clone->progressCallback = $callback; return $clone;
+        $clone = clone $this;
+        $clone->progressCallback = $callback;
+
+        return $clone;
     }
 
     public function withChunkSize(int $bytes): self {
         if ($bytes < 1024) {
-            throw new \\InvalidArgumentException("Chunk size must be at least 1024 bytes");
+            throw new \InvalidArgumentException("Chunk size must be at least 1024 bytes");
         }
 
         $clone = clone $this;
@@ -70,12 +73,31 @@ class Downloader {
     }
 
     public function withHeader(string $name, string $value): self {
-        $clone = clone $this; $clone->headers[$name] = $value; return $clone;
+        if (!preg_match("@^[!#$%&'*+.^_\`|~0-9A-Za-z-]+$@", $name)) {
+            throw new \InvalidArgumentException("Invalid HTTP header name: " . $name);
+        }
+
+        if (strpbrk($value, "\r\n") !== false) {
+            throw new \InvalidArgumentException("HTTP header values cannot contain line breaks");
+        }
+
+        $clone = clone $this;
+        $clone->headers[$name] = $value;
+
+        return $clone;
     }
 
     public function withHeaders(array $headers): self {
         $clone = clone $this;
-        $clone->headers = array_merge($clone->headers, $headers);
+
+        foreach ($headers as $name => $value) {
+            if (!is_string($name) || !is_string($value)) {
+                throw new \InvalidArgumentException("HTTP headers must use string names and values");
+            }
+
+            $clone = $clone->withHeader($name, $value);
+        }
+
         return $clone;
     }
 
@@ -85,7 +107,7 @@ class Downloader {
 
     public function withRetries(int $maxRetries, int $delaySeconds = 1): self {
         if ($maxRetries < 1 || $delaySeconds < 0) {
-            throw new \\InvalidArgumentException("Retries must be positive and delay cannot be negative");
+            throw new \InvalidArgumentException("Retries must be positive and delay cannot be negative");
         }
 
         $clone = clone $this;
@@ -99,11 +121,17 @@ class Downloader {
     public function getFilename(): string { return $this->filename; }
 
     public function canResume(): bool {
-        return $this->resume && file_exists($this->savePath);
+        return $this->resume && is_file($this->savePath);
     }
 
     public function getExistingSize(): int {
-        return $this->canResume() ? (int)filesize($this->savePath) : 0;
+        if (!$this->canResume()) {
+            return 0;
+        }
+
+        $size = filesize($this->savePath);
+
+        return $size === false ? 0 : (int) $size;
     }
 
     public function getRequest(): Request {

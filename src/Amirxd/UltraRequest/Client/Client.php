@@ -139,6 +139,19 @@ class Client {
                         continue;
                     }
 
+                    if ($statusCode === 416) {
+                        $contentRange = $result['headers']['content-range'] ?? '';
+
+                        if (
+                            $downloader->canResume()
+                            && preg_match('/^bytes\s+\*\/(\d+)$/i', $contentRange, $range)
+                            && (int) $range[1] === $downloader->getExistingSize()
+                        ) {
+                            // The server confirms that the existing file already contains all bytes.
+                            return true;
+                        }
+                    }
+
                     if ($statusCode < 200 || $statusCode >= 300) {
                         throw new \RuntimeException("Server returned HTTP status " . $statusCode);
                     }
@@ -211,7 +224,7 @@ class Client {
             $options[CURLOPT_HEADER] = false;
             $options[CURLOPT_FOLLOWLOCATION] = false;
             $options[CURLOPT_UNRESTRICTED_AUTH] = false;
-            $options[CURLOPT_BUFFERSIZE] = max(1024, min(10 * 1024 * 1024, $downloader->getChunkSize()));
+            $options[CURLOPT_BUFFERSIZE] = max(1024, min(512 * 1024, $downloader->getChunkSize()));
 
             $options[CURLOPT_HEADERFUNCTION] = function ($handle, string $line) use (
                 &$statusCode,
@@ -234,12 +247,12 @@ class Client {
                 if ($trimmed === '') {
                     $mode = null;
 
-                    if ($statusCode === 200) {
+                    if (!is_resource($fileHandle) && $statusCode === 200) {
                         // A server may ignore Range and return the complete file.
                         // In that case the old partial file must be truncated.
                         $initialSize = 0;
                         $mode = 'wb';
-                    } elseif ($statusCode === 206) {
+                    } elseif (!is_resource($fileHandle) && $statusCode === 206) {
                         $contentRange = $headers['content-range'] ?? '';
 
                         if (
@@ -813,7 +826,13 @@ class Client {
 
     private function applyCurlOptions(mixed $ch, array $options): void {
         foreach ($options as $option => $value) {
-            if (is_int($option) && $option > 0) curl_setopt($ch, $option, $value);
+            if (!is_int($option) || $option <= 0) {
+                continue;
+            }
+
+            if (!curl_setopt($ch, $option, $value)) {
+                throw new \RuntimeException("Unable to apply cURL option: " . $option);
+            }
         }
     }
 

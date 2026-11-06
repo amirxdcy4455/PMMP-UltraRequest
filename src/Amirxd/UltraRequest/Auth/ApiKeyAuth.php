@@ -17,6 +17,10 @@ class ApiKeyAuth implements AuthInterface {
             throw new \InvalidArgumentException("API key name cannot be empty or contain line breaks");
         }
 
+        if ($placement === 'header' && !preg_match("@^[!#$%&'*+.^_\`|~0-9A-Za-z-]+$@", $key)) {
+            throw new \InvalidArgumentException("Invalid API key header name: " . $key);
+        }
+
         if (strpbrk($value, "\r\n") !== false || ($prefix !== null && strpbrk($prefix, "\r\n") !== false)) {
             throw new \InvalidArgumentException("API key values and prefixes cannot contain line breaks");
         }

@@ -42,7 +42,7 @@ class Cookie implements CookieInterface {
         $parts  = parse_url($url);
         $host   = $parts['host']   ?? '';
         $path   = $parts['path']   ?? '/';
-        $scheme = $parts['scheme'] ?? 'http';
+        $scheme = strtolower($parts['scheme'] ?? 'http');
 
         if ($this->secure && $scheme !== 'https') return false;
         if ($this->domain !== null && !$this->domainMatches($host)) return false;

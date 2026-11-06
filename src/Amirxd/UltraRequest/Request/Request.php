@@ -56,7 +56,15 @@ class Request implements RequestInterface {
 
     public function withHeaders(array $headers): self {
         $clone = clone $this;
-        $clone->headers = array_merge($clone->headers, $headers);
+
+        foreach ($headers as $name => $value) {
+            if (!is_string($name) || !is_string($value)) {
+                throw new \InvalidArgumentException("HTTP headers must use string names and values");
+            }
+
+            $clone = $clone->withHeader($name, $value);
+        }
+
         return $clone;
     }
 
