@@ -42,7 +42,7 @@ class Cookie implements CookieInterface {
         $parts  = parse_url($url);
         $host   = $parts['host']   ?? '';
         $path   = $parts['path']   ?? '/';
-        $scheme = $parts['scheme'] ?? 'http';
+        $scheme = strtolower($parts['scheme'] ?? 'http');
 
         if ($this->secure && $scheme !== 'https') return false;
         if ($this->domain !== null && !$this->domainMatches($host)) return false;
@@ -52,15 +52,36 @@ class Cookie implements CookieInterface {
     }
 
     private function domainMatches(string $host): bool {
-        $domain = ltrim($this->domain, '.');
-        if ($host === $domain) return true;
-        if (str_ends_with($host, '.' . $domain)) return !filter_var($host, FILTER_VALIDATE_IP);
-        return false;
+        $domain = strtolower(ltrim($this->domain, '.'));
+        $host = strtolower($host);
+
+        if ($host === $domain) {
+            return true;
+        }
+
+        if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
+            return false;
+        }
+
+        return str_ends_with($host, '.' . $domain);
     }
 
     private function pathMatches(string $path): bool {
-        if ($this->path === '/') return true;
-        return str_starts_with($path, $this->path);
+        $cookiePath = $this->path === '' || !str_starts_with($this->path, '/')
+            ? '/'
+            : $this->path;
+
+        if ($path === $cookiePath) {
+            return true;
+        }
+
+        if (!str_starts_with($path, $cookiePath)) {
+            return false;
+        }
+
+        // RFC cookie path matching requires a path-segment boundary.
+        return str_ends_with($cookiePath, '/')
+            || ($path[strlen($cookiePath)] ?? '') === '/';
     }
 
     public function __serialize(): array {

@@ -115,29 +115,64 @@ class CookieJar implements CookieJarInterface {
     }
 
     private function save(): void {
-        if ($this->storagePath === null) return;
+        if ($this->storagePath === null) {
+            return;
+        }
+
+        $directory = dirname($this->storagePath);
+
+        if (!is_dir($directory) && !mkdir($directory, 0777, true) && !is_dir($directory)) {
+            throw new \RuntimeException("Unable to create cookie storage directory: " . $directory);
+        }
+
         $data = [];
+
         foreach ($this->getAllCookies() as $cookie) {
             if ($cookie instanceof Cookie) {
                 $data[] = $cookie->__serialize();
             }
         }
-        @file_put_contents(
-            $this->storagePath,
-            json_encode($data, JSON_PRETTY_PRINT | JSON_BIGINT_AS_STRING | JSON_THROW_ON_ERROR),
-            LOCK_EX
+
+        $json = json_encode(
+            $data,
+            JSON_PRETTY_PRINT | JSON_BIGINT_AS_STRING | JSON_THROW_ON_ERROR
         );
+
+        $written = file_put_contents($this->storagePath, $json, LOCK_EX);
+
+        if ($written === false) {
+            throw new \RuntimeException("Unable to write cookie storage file: " . $this->storagePath);
+        }
     }
 
     private function load(): void {
-        if ($this->storagePath === null || !file_exists($this->storagePath)) return;
-        $content = @file_get_contents($this->storagePath);
-        if ($content === false) return;
-        $data = json_decode($content, true);
-        if (!is_array($data)) return;
+        if ($this->storagePath === null || !file_exists($this->storagePath)) {
+            return;
+        }
+
+        $content = file_get_contents($this->storagePath);
+
+        if ($content === false) {
+            throw new \RuntimeException("Unable to read cookie storage file: " . $this->storagePath);
+        }
+
+        try {
+            $data = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $exception) {
+            throw new \RuntimeException("Cookie storage contains invalid JSON", 0, $exception);
+        }
+
+        if (!is_array($data)) {
+            throw new \RuntimeException("Cookie storage must contain a JSON array");
+        }
+
         $this->cookies = [];
+
         foreach ($data as $cookieData) {
-            if (!isset($cookieData['name'], $cookieData['value'])) continue;
+            if (!is_array($cookieData) || !isset($cookieData['name'], $cookieData['value'])) {
+                continue;
+            }
+
             $cookie = new Cookie($cookieData['name'], $cookieData['value'], $cookieData);
             $this->cookies[$this->getCookieKey($cookie)] = $cookie;
         }

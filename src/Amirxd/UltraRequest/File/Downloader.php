@@ -51,20 +51,53 @@ class Downloader {
     }
 
     public function withProgress(callable $callback): self {
-        $clone = clone $this; $clone->progressCallback = $callback; return $clone;
+        $clone = clone $this;
+        $clone->progressCallback = $callback;
+
+        return $clone;
     }
 
     public function withChunkSize(int $bytes): self {
-        $clone = clone $this; $clone->chunkSize = $bytes; return $clone;
+        if ($bytes < 1024) {
+            throw new \InvalidArgumentException("Chunk size must be at least 1024 bytes");
+        }
+
+        $clone = clone $this;
+        $clone->chunkSize = $bytes;
+
+        return $clone;
+    }
+
+    public function getChunkSize(): int {
+        return $this->chunkSize;
     }
 
     public function withHeader(string $name, string $value): self {
-        $clone = clone $this; $clone->headers[$name] = $value; return $clone;
+        if (!preg_match("@^[!#$%&'*+.^_\`|~0-9A-Za-z-]+$@", $name)) {
+            throw new \InvalidArgumentException("Invalid HTTP header name: " . $name);
+        }
+
+        if (strpbrk($value, "\r\n") !== false) {
+            throw new \InvalidArgumentException("HTTP header values cannot contain line breaks");
+        }
+
+        $clone = clone $this;
+        $clone->headers[$name] = $value;
+
+        return $clone;
     }
 
     public function withHeaders(array $headers): self {
         $clone = clone $this;
-        $clone->headers = array_merge($clone->headers, $headers);
+
+        foreach ($headers as $name => $value) {
+            if (!is_string($name) || !is_string($value)) {
+                throw new \InvalidArgumentException("HTTP headers must use string names and values");
+            }
+
+            $clone = $clone->withHeader($name, $value);
+        }
+
         return $clone;
     }
 
@@ -73,6 +106,10 @@ class Downloader {
     }
 
     public function withRetries(int $maxRetries, int $delaySeconds = 1): self {
+        if ($maxRetries < 1 || $delaySeconds < 0) {
+            throw new \InvalidArgumentException("Retries must be positive and delay cannot be negative");
+        }
+
         $clone = clone $this;
         $clone->maxRetries  = $maxRetries;
         $clone->retryDelay  = $delaySeconds;
@@ -84,11 +121,17 @@ class Downloader {
     public function getFilename(): string { return $this->filename; }
 
     public function canResume(): bool {
-        return $this->resume && file_exists($this->savePath);
+        return $this->resume && is_file($this->savePath);
     }
 
     public function getExistingSize(): int {
-        return $this->canResume() ? (int)filesize($this->savePath) : 0;
+        if (!$this->canResume()) {
+            return 0;
+        }
+
+        $size = filesize($this->savePath);
+
+        return $size === false ? 0 : (int) $size;
     }
 
     public function getRequest(): Request {
@@ -107,20 +150,65 @@ class Downloader {
         return true;
     }
 
+    /**
+     * Saves a buffered response. A 200 response always replaces the old file;
+     * a 206 response is appended only when its Content-Range starts at the
+     * current partial-file size.
+     */
     public function save(HttpResponse $response): bool {
-        if (!$response->isSuccessful() && $response->getStatusCode() !== 206) return false;
+        $statusCode = $response->getStatusCode();
 
-        $dir = dirname($this->savePath);
-        if (!is_dir($dir)) {
-            mkdir($dir, 0777, true);
+        if ($statusCode === 200) {
+            $mode = 'wb';
+        } elseif ($statusCode === 206) {
+            $contentRange = $response->getHeader('content-range') ?? '';
+
+            if (!preg_match('/^bytes\\s+(\\d+)-(\\d+)\\/(?:\\d+|\\*)$/i', $contentRange, $matches)) {
+                return false;
+            }
+
+            $existingSize = $this->canResume() ? $this->getExistingSize() : 0;
+
+            if ((int) $matches[1] !== $existingSize) {
+                return false;
+            }
+
+            $mode = $existingSize > 0 ? 'ab' : 'wb';
+        } else {
+            return false;
         }
 
-        $fp = fopen($this->savePath, $this->canResume() ? 'ab' : 'wb');
-        if ($fp === false) return false;
+        $directory = dirname($this->savePath);
 
-        $bytesWritten = fwrite($fp, $response->getBody() ?? '');
-        fclose($fp);
-        return $bytesWritten !== false;
+        if (!is_dir($directory) && !mkdir($directory, 0777, true) && !is_dir($directory)) {
+            return false;
+        }
+
+        $file = fopen($this->savePath, $mode);
+
+        if ($file === false) {
+            return false;
+        }
+
+        try {
+            $body = $response->getBody() ?? '';
+            $length = strlen($body);
+            $written = 0;
+
+            while ($written < $length) {
+                $result = fwrite($file, substr($body, $written));
+
+                if ($result === false || $result === 0) {
+                    return false;
+                }
+
+                $written += $result;
+            }
+
+            return true;
+        } finally {
+            fclose($file);
+        }
     }
 
     public function getProgress(float $downloaded, float $total): array {
